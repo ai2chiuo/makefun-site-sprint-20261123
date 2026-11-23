@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/site-generator-speed-01-run-20261122/ai2chiuo/makefun-site-sprint-20261123/rank.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 [![reward](https://make.fun/badge/site-generator-speed-01-run-20261122/ai2chiuo/makefun-site-sprint-20261123/reward.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 
-A dependency-free static site generator for the make.fun reference dialect. Compiled templates use indexed scope bindings that loops save and restore. Markdown scans source ranges and escapes fenced blocks in one pass. Link resolution is cached by source directory, and the driver serializes each completed case before building the next one. Template text is emitted as quoted literals.
+A dependency-free static site generator for the make.fun reference dialect. Compiled templates use indexed scope bindings that loops save and restore. Repeated includes can reuse rendered output within a case when their inputs and remaining include depth match. Markdown scans source ranges and escapes fenced blocks in one pass. Link resolution is cached by source directory, and the driver serializes each completed case before building the next one. Template text is emitted as quoted literals.
 
 ## Run it
 

@@ -162,15 +162,19 @@ function scanTemplate(source) {
   return parts;
 }
 
-function dependencies(parts) {
+function dependencies(parts, includeNames) {
   const heads = new Set();
   for (const part of parts) {
     if (typeof part === 'string') continue;
-    if (part.kind === 'include') return null;
+    if (part.kind === 'include') {
+      if (!includeNames) return null;
+      for (const name of includeNames(part.name)) heads.add(name);
+      continue;
+    }
     if (part.read) heads.add(part.read.head);
     for (const branch of [part.body, part.other]) {
       if (!branch) continue;
-      const inner = dependencies(branch);
+      const inner = dependencies(branch, includeNames);
       if (!inner) return null;
       if (part.kind === 'for') {
         inner.delete(part.name);
@@ -190,9 +194,8 @@ function reusable(parts) {
 function memoize(fn, slots) {
   let previous, text;
   return (scope, templates, depth) => {
-    const values = slots.map(slot => scope[slot]);
-    if (previous && values.every((v, i) => Object.is(v, previous[i]))) return text;
-    previous = values;
+    if (previous && slots.every((slot, i) => Object.is(scope[slot], previous[i]))) return text;
+    previous = slots.map(slot => scope[slot]);
     return text = fn(scope, templates, depth);
   };
 }
@@ -256,7 +259,7 @@ function specialize(parts, escape, binding, memo = true) {
   return heads ? memoize(render, heads.map(binding)) : render;
 }
 
-function compile(source, escape, binding) {
+function parseTemplate(source) {
   const root = [];
   const stack = [{ active: root }];
   for (const part of scanTemplate(source)) {
@@ -289,7 +292,55 @@ function compile(source, escape, binding) {
     }
   }
   if (stack.length > 1) throw new SyntaxError('a ' + stack[stack.length - 1].node.kind + ' is not closed');
-  return specialize(root, escape, binding);
+  return root;
+}
+
+// Included templates can reuse their output when they read at most one outer
+// binding. Track the depth separately because includes stop at depth eight.
+// The loop record is mutable, so renders that read it directly are uncached.
+function buildRenderers(parsed, escape, binding) {
+  const namesByDepth = Array.from({length: 9}, () => new Map());
+  const empty = new Set();
+  function namesAt(name, depth) {
+    const parts = parsed.get(name);
+    if (!parts) return empty;
+    const names = namesByDepth[depth];
+    let result = names.get(name);
+    if (!result) {
+      result = dependencies(parts, child => depth === 8 ? empty : namesAt(child, depth + 1));
+      names.set(name, result);
+    }
+    return result;
+  }
+
+  const renderers = new Map();
+  for (const [name, parts] of parsed) {
+    let render;
+    const byDepth = [];
+    renderers.set(name, (scope, templates, depth) => {
+      render ??= specialize(parts, escape, binding);
+      if (depth === 0) return render(scope, templates, depth);
+      let memo = byDepth[depth];
+      if (memo === undefined) {
+        const names = namesAt(name, depth);
+        if (names.size > 1 || names.has('loop')) {
+          memo = null;
+        } else {
+          const input = names.values().next().value;
+          memo = {slot: input === undefined ? -1 : binding(input), results: new Map()};
+        }
+        byDepth[depth] = memo;
+      }
+      if (!memo) return render(scope, templates, depth);
+      const value = scope[memo.slot];
+      const cached = memo.results.get(value);
+      if (cached !== undefined) return cached;
+      const output = render(scope, templates, depth);
+      if (memo.results.size < 2048) memo.results.set(value, output);
+      return output;
+    });
+  }
+  return renderers;
 }
 
 // Most relative targets can use their path verbatim. Keep the split path
@@ -359,15 +410,16 @@ export function run(input) {
     if (slot === undefined) slots.set(name, slot = slots.size);
     return slot;
   };
-  const templates = new Map();
+  const parsed = new Map();
   for (const name of Object.keys(input.templates).sort()) {
     try {
-      templates.set(name, compile(input.templates[name], escape, binding));
+      parsed.set(name, parseTemplate(input.templates[name]));
     } catch (error) {
       if (!(error instanceof SyntaxError)) throw error;
       diagnostics.push('template "' + name + '": ' + error.message);
     }
   }
+  const templates = buildRenderers(parsed, escape, binding);
 
   const pages = [];
   const posts = [];

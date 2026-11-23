@@ -44,9 +44,9 @@ function spans(text, link, escape) {
   let cursor = 0;
   let output = '';
   special.lastIndex = 0;
-  for (let match; (match = special.exec(text));) {
-    const at = match.index;
-    const char = match[0];
+  while (special.test(text)) {
+    const at = special.lastIndex - 1;
+    const char = text[at];
     if (at > cursor) output += text.slice(cursor, at);
     cursor = at + 1;
 
