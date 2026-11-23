@@ -1,7 +1,7 @@
 import { markdown } from './markdown.js';
 
 const entities = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const html = (s) => s.replace(/[&<>"']/g, (c) => entities[c]);
+const html = (s) => /[&<>"']/.test(s) ? s.replace(/[&<>"']/g, (c) => entities[c]) : s;
 const order = (a, b) => (a < b ? -1 : Number(a > b));
 const trim = (s) => s.replace(/^[ \t]+|[ \t]+$/g, '');
 const blank = /^[ \t]*$/;
@@ -112,22 +112,22 @@ const pathSyntax = /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$/;
 function reader(path) {
   if (!pathSyntax.test(path)) throw new SyntaxError(JSON.stringify(path) + ' is not a path');
   const [head, ...tail] = path.split('.');
-  if (!tail.length) return (scope) => scope[head];
+  if (!tail.length) return Object.assign((scope) => scope[head], { head });
   if (tail.length === 1) {
     const key = tail[0];
-    return (scope) => {
+    return Object.assign((scope) => {
       const value = scope[head];
       return value && typeof value === 'object' && Object.hasOwn(value, key) ? value[key] : undefined;
-    };
+    }, { head });
   }
-  return (scope) => {
+  return Object.assign((scope) => {
     let value = scope[head];
     for (const key of tail) {
       if (!value || typeof value !== 'object' || !Object.hasOwn(value, key)) return undefined;
       value = value[key];
     }
     return value;
-  };
+  }, { head });
 }
 
 function display(value) {
@@ -170,42 +170,96 @@ function scanTemplate(source) {
   return parts;
 }
 
-function render(parts, scope, templates, depth) {
-  let output = '';
+function dependencies(parts) {
+  const heads = new Set();
   for (const part of parts) {
-    if (typeof part === 'string') {
-      output += part;
-    } else if (part.kind === 'for') {
-      const items = part.read(scope);
-      if (!Array.isArray(items) || !items.length) continue;
-      const frame = Object.create(scope);
-      const loop = { index: 0, first: true, last: false, length: items.length };
-      for (let i = 0; i < items.length; i++) {
-        // Define the binding even for names such as "__proto__" and "loop".
-        frame[part.name] = items[i];
-        frame.loop = loop;
-        loop.index = i + 1;
-        loop.first = i === 0;
-        loop.last = i + 1 === items.length;
-        output += render(part.body, frame, templates, depth);
+    if (typeof part === 'string') continue;
+    if (part.kind === 'include') return null;
+    if (part.read) heads.add(part.read.head);
+    for (const branch of [part.body, part.other]) {
+      if (!branch) continue;
+      const inner = dependencies(branch);
+      if (!inner) return null;
+      if (part.kind === 'for') {
+        inner.delete(part.name);
+        inner.delete('loop');
       }
-    } else if (part.kind === 'if') {
-      const value = part.read(scope);
-      const yes = Array.isArray(value) ? value.length > 0 : Boolean(value) || Number.isNaN(value);
-      const branch = yes !== part.negate ? part.body : part.other;
-      if (branch) output += render(branch, scope, templates, depth);
-    } else if (part.kind === 'include') {
-      const included = templates.get(part.name);
-      if (included && depth < 8) output += render(included, scope, templates, depth + 1);
-    } else {
-      const value = display(part.read(scope));
-      output += part.raw ? value : html(value);
+      for (const head of inner) heads.add(head);
     }
   }
-  return output;
+  return heads;
 }
 
-function compile(source) {
+function reusable(parts) {
+  const heads = dependencies(parts);
+  return heads && [...heads].every(k => k === 'site' || k === 'tags' || k === 'recent') ? [...heads] : null;
+}
+
+function memoize(fn, heads) {
+  let previous, text;
+  return (scope, templates, depth) => {
+    const values = heads.map(k => scope[k]);
+    if (previous && values.every((v, i) => Object.is(v, previous[i]))) return text;
+    previous = values;
+    return text = fn(scope, templates, depth);
+  };
+}
+
+function specialize(parts, escape, memo = true) {
+  const reads = [];
+  const blocks = [];
+  let serial = 0;
+  const read = (part, scope) => {
+    reads.push(part.read);
+    return `r[${reads.length - 1}](${scope})`;
+  };
+  function emit(nodes, scope) {
+    let code = '';
+    for (const part of nodes) {
+      if (memo && typeof part !== 'string' && (part.kind === 'for' || part.kind === 'if')) {
+        const heads = reusable([part]);
+        if (heads) {
+          blocks.push(memoize(specialize([part], escape, false), heads));
+          code += `o+=b[${blocks.length - 1}](${scope},t,d);`;
+          continue;
+        }
+      }
+      if (typeof part === 'string') {
+        code += `o+=${JSON.stringify(part)};`;
+      } else if (part.kind === 'for') {
+        const n = serial++;
+        const a = `a${n}`, f = `s${n}`, l = `l${n}`, i = `i${n}`;
+        code += `{const ${a}=${read(part, scope)};if(Array.isArray(${a})&&${a}.length){`;
+        code += `const ${f}=Object.create(${scope}),${l}={index:0,first:true,last:false,length:${a}.length};`;
+        code += `for(let ${i}=0;${i}<${a}.length;${i}++){`;
+        code += `${f}[${JSON.stringify(part.name)}]=${a}[${i}];${f}.loop=${l};`;
+        code += `${l}.index=${i}+1;${l}.first=${i}===0;${l}.last=${i}+1===${a}.length;`;
+        code += emit(part.body, f) + '}}}';
+      } else if (part.kind === 'if') {
+        const v = `v${serial++}`;
+        code += `{const ${v}=${read(part, scope)};if((Array.isArray(${v})?${v}.length>0:Boolean(${v})||Number.isNaN(${v}))!==${part.negate}){`;
+        code += emit(part.body, scope) + '}';
+        if (part.other) code += 'else{' + emit(part.other, scope) + '}';
+        code += '}';
+      } else if (part.kind === 'include') {
+        const t = `t${serial++}`;
+        code += `{const ${t}=t.get(${JSON.stringify(part.name)});if(${t}&&d<8)o+=${t}(${scope},t,d+1);}`;
+      } else {
+        const value = `display(${read(part, scope)})`;
+        code += 'o+=' + (part.raw ? value : `html(${value})`) + ';';
+      }
+    }
+    return code;
+  }
+  // Only fixed syntax, integer slots and JSON-quoted strings enter generated code.
+  // Path readers remain closures: template text is never executable JavaScript.
+  const code = 'return function(s,t,d){let o="";' + emit(parts, 's') + 'return o;}';
+  const fn = new Function('r', 'html', 'display', 'b', code)(reads, escape, display, blocks);
+  const heads = memo && reusable(parts);
+  return heads ? memoize(fn, heads) : fn;
+}
+
+function compile(source, escape) {
   const root = [];
   const stack = [{ active: root }];
   for (const part of scanTemplate(source)) {
@@ -238,7 +292,7 @@ function compile(source) {
     }
   }
   if (stack.length > 1) throw new SyntaxError('a ' + stack[stack.length - 1].node.kind + ' is not closed');
-  return root;
+  return specialize(root, escape);
 }
 
 
@@ -266,13 +320,23 @@ function neighbor(card) {
 }
 
 export function run(input) {
+  // Escaping is pure; this cache belongs to one build and never crosses cases.
+  const escaped = new Map();
+  const escape = (text) => {
+    let result = escaped.get(text);
+    if (result === undefined) {
+      result = html(text);
+      escaped.set(text, result);
+    }
+    return result;
+  };
   const { site, files } = input;
   const base = site.base_url.replace(/\/+$/, '');
   const diagnostics = [];
   const templates = new Map();
   for (const name of Object.keys(input.templates).sort()) {
     try {
-      templates.set(name, compile(input.templates[name]));
+      templates.set(name, compile(input.templates[name], escape));
     } catch (error) {
       if (!(error instanceof SyntaxError)) throw error;
       diagnostics.push('template "' + name + '": ' + error.message);
@@ -349,7 +413,7 @@ export function run(input) {
       return target;
     };
     let headingNames;
-    const md = markdown(data.body, resolve, html, (text) => {
+    const md = markdown(data.body, resolve, escape, (text) => {
       headingNames ??= new Names();
       return headingNames.claim(slug(text));
     });
@@ -408,7 +472,7 @@ export function run(input) {
   const output = {};
   function write(path, layout, values) {
     const template = templates.get(layout);
-    if (template) output[path] = render(template, Object.assign(Object.create(shared), values), templates, 0);
+    if (template) output[path] = template(Object.assign(Object.create(shared), values), templates, 0);
   }
 
   for (const source of pages) {
