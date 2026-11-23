@@ -8,6 +8,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22.23.5'
@@ -20,4 +22,9 @@ jobs:
       - name: Verify kit, exact output and deterministic driver
         run: node .github/ci-verify.mjs "$RUNNER_TEMP/site-kit/site-generator-speed-01-run-20261122-kit"
       - name: Run official container grader
-        run: node "$RUNNER_TEMP/site-kit/site-generator-speed-01-run-20261122-kit/cli/makefun.mjs" grade-local --kit "$RUNNER_TEMP/site-kit/site-generator-speed-01-run-20261122-kit" --bot "$GITHUB_WORKSPACE" --driver docker
+        run: node "$RUNNER_TEMP/site-kit/site-generator-speed-01-run-20261122-kit/cli/makefun.mjs" grade-local --kit "$RUNNER_TEMP/site-kit/site-generator-speed-01-run-20261122-kit" --bot "$GITHUB_WORKSPACE" --driver docker --out "$RUNNER_TEMP/site-grade" --json > "$RUNNER_TEMP/site-grade-result.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: official-site-grade
+          path: ${{ runner.temp }}/site-grade-result.json
