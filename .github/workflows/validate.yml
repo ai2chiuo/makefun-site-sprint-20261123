@@ -22,7 +22,7 @@ jobs:
       - name: Verify kit, exact output and deterministic driver
         run: node .github/ci-verify.mjs "$RUNNER_TEMP/site-kit/site-generator-speed-01-run-20261122-kit"
       - name: Run official container grader
-        run: node "$RUNNER_TEMP/site-kit/site-generator-speed-01-run-20261122-kit/cli/makefun.mjs" grade-local --kit "$RUNNER_TEMP/site-kit/site-generator-speed-01-run-20261122-kit" --bot "$GITHUB_WORKSPACE" --driver docker --out "$RUNNER_TEMP/site-grade" --json > "$RUNNER_TEMP/site-grade-result.json"
+        run: node "$RUNNER_TEMP/site-kit/site-generator-speed-01-run-20261122-kit/cli/makefun.mjs" grade-local --kit "$RUNNER_TEMP/site-kit/site-generator-speed-01-run-20261122-kit" --bot "$GITHUB_WORKSPACE" --driver docker --save "$RUNNER_TEMP/site-grade" --json > "$RUNNER_TEMP/site-grade-result.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
