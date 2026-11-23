@@ -9,7 +9,10 @@ const directory = (path) => path.slice(0, Math.max(0, path.lastIndexOf('/')));
 
 function slugOf(s) {
   const plain = /[^\x00-\x7f]/.test(s) ? s.normalize('NFKD').replace(/\p{M}/gu, '') : s;
-  return plain.replace(/[^A-Za-z0-9]+/g, '-').toLowerCase().replace(/^-/, '').slice(0, 64).replace(/-$/, '') || 'untitled';
+  const dashed = plain.replace(/[^A-Za-z0-9]+/g, '-');
+  const start = Number(dashed[0] === '-');
+  const end = Math.min(dashed.length, start + 64);
+  return dashed.slice(start, end - Number(dashed[end - 1] === '-')).toLowerCase() || 'untitled';
 }
 
 // Each base resumes where its last collision search ended. Occupied names never disappear.
@@ -106,28 +109,17 @@ function metadata(text) {
   return Object.hasOwn(data, 'title') ? data : 'no title';
 }
 
-// Compile paths once. Only scope bindings are inherited; traversal inside values uses own properties.
+// Paths read a lexical binding first, then traverse only own properties.
 const pathSyntax = /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$/;
 
-function reader(path) {
+function templatePath(path) {
   if (!pathSyntax.test(path)) throw new SyntaxError(JSON.stringify(path) + ' is not a path');
   const [head, ...tail] = path.split('.');
-  if (!tail.length) return Object.assign((scope) => scope[head], { head });
-  if (tail.length === 1) {
-    const key = tail[0];
-    return Object.assign((scope) => {
-      const value = scope[head];
-      return value && typeof value === 'object' && Object.hasOwn(value, key) ? value[key] : undefined;
-    }, { head });
-  }
-  return Object.assign((scope) => {
-    let value = scope[head];
-    for (const key of tail) {
-      if (!value || typeof value !== 'object' || !Object.hasOwn(value, key)) return undefined;
-      value = value[key];
-    }
-    return value;
-  }, { head });
+  return { head, tail };
+}
+
+function own(value, key) {
+  return value !== null && typeof value === 'object' && Object.hasOwn(value, key) ? value[key] : undefined;
 }
 
 function display(value) {
@@ -163,7 +155,7 @@ function scanTemplate(source) {
       }
     }
     if (before > offset) parts.push(source.slice(offset, before));
-    parts.push(tag ? { tag: value } : { read: reader(value), raw });
+    parts.push(tag ? { tag: value } : { read: templatePath(value), raw });
     opener.lastIndex = offset = after;
   }
   if (offset < source.length) parts.push(source.slice(offset));
@@ -195,71 +187,76 @@ function reusable(parts) {
   return heads && [...heads].every(k => k === 'site' || k === 'tags' || k === 'recent') ? [...heads] : null;
 }
 
-function memoize(fn, heads) {
+function memoize(fn, slots) {
   let previous, text;
   return (scope, templates, depth) => {
-    const values = heads.map(k => scope[k]);
+    const values = slots.map(slot => scope[slot]);
     if (previous && values.every((v, i) => Object.is(v, previous[i]))) return text;
     previous = values;
     return text = fn(scope, templates, depth);
   };
 }
 
-function specialize(parts, escape, memo = true) {
-  const reads = [];
+function specialize(parts, escape, binding, memo = true) {
   const blocks = [];
   let serial = 0;
-  const read = (part, scope) => {
-    reads.push(part.read);
-    return `r[${reads.length - 1}](${scope})`;
+  const loopSlot = binding('loop');
+  const read = ({ read: { head, tail } }) => {
+    let code = `s[${binding(head)}]`;
+    for (const key of tail) code = `own(${code},${JSON.stringify(key)})`;
+    return code;
   };
-  function emit(nodes, scope) {
+
+  function emit(nodes) {
     let code = '';
     for (const part of nodes) {
-      if (memo && typeof part !== 'string' && (part.kind === 'for' || part.kind === 'if')) {
+      if (typeof part === 'string') {
+        code += `o+=${JSON.stringify(part)};`;
+        continue;
+      }
+      if (memo && (part.kind === 'for' || part.kind === 'if')) {
         const heads = reusable([part]);
         if (heads) {
-          blocks.push(memoize(specialize([part], escape, false), heads));
-          code += `o+=b[${blocks.length - 1}](${scope},t,d);`;
+          const render = specialize([part], escape, binding, false);
+          blocks.push(memoize(render, heads.map(binding)));
+          code += `o+=b[${blocks.length - 1}](s,t,d);`;
           continue;
         }
       }
-      if (typeof part === 'string') {
-        code += `o+=${JSON.stringify(part)};`;
-      } else if (part.kind === 'for') {
+      if (part.kind === 'for') {
         const n = serial++;
-        const a = `a${n}`, f = `s${n}`, l = `l${n}`, i = `i${n}`;
-        code += `{const ${a}=${read(part, scope)};if(Array.isArray(${a})&&${a}.length){`;
-        code += `const ${f}=Object.create(${scope}),${l}={index:0,first:true,last:false,length:${a}.length};`;
-        code += `for(let ${i}=0;${i}<${a}.length;${i}++){`;
-        code += `${f}[${JSON.stringify(part.name)}]=${a}[${i}];${f}.loop=${l};`;
+        const a = `a${n}`, l = `l${n}`, i = `i${n}`, old = `old${n}`, previous = `previous${n}`;
+        const slot = binding(part.name);
+        code += `{const ${a}=${read(part)};if(Array.isArray(${a})&&${a}.length){`;
+        code += `const ${old}=s[${slot}],${previous}=s[${loopSlot}],${l}={index:0,first:true,last:false,length:${a}.length};`;
+        code += `s[${loopSlot}]=${l};for(let ${i}=0;${i}<${a}.length;${i}++){`;
+        if (slot !== loopSlot) code += `s[${slot}]=${a}[${i}];`;
         code += `${l}.index=${i}+1;${l}.first=${i}===0;${l}.last=${i}+1===${a}.length;`;
-        code += emit(part.body, f) + '}}}';
+        code += emit(part.body) + `}s[${slot}]=${old};s[${loopSlot}]=${previous};}}`;
       } else if (part.kind === 'if') {
         const v = `v${serial++}`;
-        code += `{const ${v}=${read(part, scope)};if((Array.isArray(${v})?${v}.length>0:Boolean(${v})||Number.isNaN(${v}))!==${part.negate}){`;
-        code += emit(part.body, scope) + '}';
-        if (part.other) code += 'else{' + emit(part.other, scope) + '}';
+        code += `{const ${v}=${read(part)};if((Array.isArray(${v})?${v}.length>0:Boolean(${v})||Number.isNaN(${v}))!==${part.negate}){`;
+        code += emit(part.body) + '}';
+        if (part.other) code += 'else{' + emit(part.other) + '}';
         code += '}';
       } else if (part.kind === 'include') {
         const t = `t${serial++}`;
-        code += `{const ${t}=t.get(${JSON.stringify(part.name)});if(${t}&&d<8)o+=${t}(${scope},t,d+1);}`;
+        code += `{const ${t}=t.get(${JSON.stringify(part.name)});if(${t}&&d<8)o+=${t}(s,t,d+1);}`;
       } else {
-        const value = `display(${read(part, scope)})`;
+        const value = `display(${read(part)})`;
         code += 'o+=' + (part.raw ? value : `html(${value})`) + ';';
       }
     }
     return code;
   }
-  // Only fixed syntax, integer slots and JSON-quoted strings enter generated code.
-  // Path readers remain closures: template text is never executable JavaScript.
-  const code = 'return function(s,t,d){let o="";' + emit(parts, 's') + 'return o;}';
-  const fn = new Function('r', 'html', 'display', 'b', code)(reads, escape, display, blocks);
+  // The emitted source contains fixed syntax, slot numbers and quoted data literals.
+  const code = 'return function(s,t,d){let o="";' + emit(parts) + 'return o;}';
+  const render = new Function('own', 'html', 'display', 'b', code)(own, escape, display, blocks);
   const heads = memo && reusable(parts);
-  return heads ? memoize(fn, heads) : fn;
+  return heads ? memoize(render, heads.map(binding)) : render;
 }
 
-function compile(source, escape) {
+function compile(source, escape, binding) {
   const root = [];
   const stack = [{ active: root }];
   for (const part of scanTemplate(source)) {
@@ -274,8 +271,8 @@ function compile(source, escape) {
     if (each || test) {
       const body = [];
       const node = each
-        ? { kind: 'for', name: each[1], read: reader(each[2]), body }
-        : { kind: 'if', negate: Boolean(test[1]), read: reader(test[2]), body };
+        ? { kind: 'for', name: each[1], read: templatePath(each[2]), body }
+        : { kind: 'if', negate: Boolean(test[1]), read: templatePath(test[2]), body };
       parent.active.push(node);
       stack.push({ node, active: body });
     } else if (tag === 'else') {
@@ -292,11 +289,15 @@ function compile(source, escape) {
     }
   }
   if (stack.length > 1) throw new SyntaxError('a ' + stack[stack.length - 1].node.kind + ' is not closed');
-  return specialize(root, escape);
+  return specialize(root, escape, binding);
 }
 
+// Most relative targets can use their path verbatim. Keep the split path
+// fallback for slash runs and dot segments, including unusual source directories.
+const noncanonical = /^(?:\.{1,2})(?:\/|$)|\/(?:\.{0,2})(?:\/|$)/;
 
 function follow(dir, target) {
+  if (!noncanonical.test(target)) return dir ? dir + '/' + target : target;
   const parts = dir ? dir.split('/') : [];
   for (const part of target.split('/')) {
     if (part === '..') {
@@ -307,6 +308,25 @@ function follow(dir, target) {
     }
   }
   return parts.join('/');
+}
+
+const linkScheme = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+
+// Each sticky match consumes exactly 200 complete words. The mandatory
+// trailing whitespace prevents a run of non-whitespace from being split.
+const wordBatch = /(?:\s*\S+\s){200}/y;
+const nextWord = /\S/g;
+
+function readingMinutes(body) {
+  let minutes = 0;
+  let end = 0;
+  wordBatch.lastIndex = 0;
+  while (wordBatch.test(body)) {
+    minutes++;
+    end = wordBatch.lastIndex;
+  }
+  nextWord.lastIndex = end;
+  return Math.max(1, minutes + Number(nextWord.test(body)));
 }
 
 function longDate(date) {
@@ -333,10 +353,16 @@ export function run(input) {
   const { site, files } = input;
   const base = site.base_url.replace(/\/+$/, '');
   const diagnostics = [];
+  const slots = new Map();
+  const binding = (name) => {
+    let slot = slots.get(name);
+    if (slot === undefined) slots.set(name, slot = slots.size);
+    return slot;
+  };
   const templates = new Map();
   for (const name of Object.keys(input.templates).sort()) {
     try {
-      templates.set(name, compile(input.templates[name], escape));
+      templates.set(name, compile(input.templates[name], escape, binding));
     } catch (error) {
       if (!(error instanceof SyntaxError)) throw error;
       diagnostics.push('template "' + name + '": ' + error.message);
@@ -399,16 +425,22 @@ export function run(input) {
   posts.sort((a, b) => order(b.data.date, a.data.date) || order(a.id, b.id));
   const groups = new Map();
   const broken = new Set();
+  const directoryLinks = new Map();
   for (const source of pages) {
     const { path, data, sourceDir } = source;
+    let links = directoryLinks.get(sourceDir);
+    if (!links) directoryLinks.set(sourceDir, links = new Map());
     const resolve = (target) => {
-      if (/^(?:[A-Za-z][A-Za-z0-9+.-]*:|[/#])/.test(target)) return target;
-      const hash = target.indexOf('#');
-      const fragment = hash < 0 ? '' : target.slice(hash);
-      const linkedPath = follow(sourceDir, hash < 0 ? target : target.slice(0, hash));
-      const url = urls.get(linkedPath);
-      if (url !== undefined) return url + fragment;
-      if (staticPaths.has(linkedPath)) return base + '/' + linkedPath + fragment;
+      if (target[0] === '/' || target[0] === '#' || linkScheme.test(target)) return target;
+      let href = links.get(target);
+      if (href === undefined) {
+        const hash = target.indexOf('#');
+        const linkedPath = follow(sourceDir, hash < 0 ? target : target.slice(0, hash));
+        const url = urls.get(linkedPath) ?? (staticPaths.has(linkedPath) ? base + '/' + linkedPath : null);
+        href = url === null || hash < 0 ? url : url + target.slice(hash);
+        links.set(target, href);
+      }
+      if (href !== null) return href;
       broken.add('broken-link ' + path + ' -> ' + target);
       return target;
     };
@@ -416,7 +448,7 @@ export function run(input) {
     const md = markdown(data.body, resolve, escape, (text) => {
       headingNames ??= new Names();
       return headingNames.claim(slug(text));
-    });
+    }, html);
     const date = data.date ?? '';
     source.card = {
       title: data.title,
@@ -425,7 +457,7 @@ export function run(input) {
       date_long: longDate(date),
       summary: data.summary ?? '',
       excerpt: md.excerpt,
-      reading_minutes: Math.max(1, Math.ceil((data.body.match(/\S+/g)?.length ?? 0) / 200)),
+      reading_minutes: readingMinutes(data.body),
       tags: [],
     };
     source.content = md.content;
@@ -464,57 +496,69 @@ export function run(input) {
 
   const sortedGroups = [...groups.values()].sort((a, b) => b.posts.length - a.posts.length || order(a.ref.slug, b.ref.slug));
   const tags = sortedGroups.map(({ ref, posts }) => ({ ...ref, count: posts.length }));
-  const shared = Object.assign(Object.create(null), {
-    site: { title: site.title, base_url: base },
-    tags,
-    recent: postCards.slice(0, site.recent),
-  });
   const output = {};
-  function write(path, layout, values) {
+  const siteSlot = binding('site');
+  const tagsSlot = binding('tags');
+  const recentSlot = binding('recent');
+  const pageSlot = binding('page');
+  const postsSlot = binding('posts');
+  const pagerSlot = binding('pager');
+  const tagSlot = binding('tag');
+
+  // Each render uses the same slots. Compiled loops save and restore lexical
+  // bindings, including loop, so includes see the caller's active bindings.
+  const scope = new Array(slots.size).fill(undefined);
+  scope[siteSlot] = { title: site.title, base_url: base };
+  scope[tagsSlot] = tags;
+  scope[recentSlot] = postCards.slice(0, site.recent);
+  function write(path, layout) {
     const template = templates.get(layout);
-    if (template) output[path] = template(Object.assign(Object.create(shared), values), templates, 0);
+    if (template) output[path] = template(scope, templates, 0);
   }
 
   for (const source of pages) {
-    write(source.route + 'index.html', source.layout, {
-      page: {
-        ...source.card,
-        slug: source.id,
-        content: source.content,
-        toc: source.toc,
-        newer: source.newer ?? null,
-        older: source.older ?? null,
-        is_post: source.post,
-      },
-    });
+    scope[pageSlot] = {
+      ...source.card,
+      slug: source.id,
+      content: source.content,
+      toc: source.toc,
+      newer: source.newer ?? null,
+      older: source.older ?? null,
+      is_post: source.post,
+    };
+    write(source.route + 'index.html', source.layout);
   }
+  scope[pageSlot] = undefined;
   if (templates.has('index')) {
     const total = Math.max(1, Math.ceil(posts.length / site.per_page));
     const indexUrl = (number) => base + (number === 1 ? '/' : '/page/' + number + '/');
     for (let number = 1; number <= total; number++) {
-      write(number === 1 ? 'index.html' : 'page/' + number + '/index.html', 'index', {
-        posts: postCards.slice((number - 1) * site.per_page, number * site.per_page),
-        pager: {
-          number,
-          total,
-          url: indexUrl(number),
-          newer_url: number === 1 ? '' : indexUrl(number - 1),
-          older_url: number === total ? '' : indexUrl(number + 1),
-        },
-      });
+      scope[postsSlot] = postCards.slice((number - 1) * site.per_page, number * site.per_page);
+      scope[pagerSlot] = {
+        number,
+        total,
+        url: indexUrl(number),
+        newer_url: number === 1 ? '' : indexUrl(number - 1),
+        older_url: number === total ? '' : indexUrl(number + 1),
+      };
+      write(number === 1 ? 'index.html' : 'page/' + number + '/index.html', 'index');
     }
+    scope[postsSlot] = undefined;
+    scope[pagerSlot] = undefined;
   }
   if (templates.has('tag')) {
     for (const [index, tag] of tags.entries()) {
-      write('tags/' + tag.slug + '/index.html', 'tag', { tag: { ...tag, posts: sortedGroups[index].posts } });
+      scope[tagSlot] = { ...tag, posts: sortedGroups[index].posts };
+      write('tags/' + tag.slug + '/index.html', 'tag');
     }
+    scope[tagSlot] = undefined;
   }
   write('tags/index.html', 'tags');
   for (const file of statics) {
     if (Object.hasOwn(output, file.path)) diagnostics.push('shadowed ' + file.path + ': a built page has its path');
     else output[file.path] = file.content;
   }
-  diagnostics.push(...broken);
+  for (const message of broken) diagnostics.push(message);
   diagnostics.sort();
   diagnostics.push('built ' + (pages.length - posts.length) + ' pages, ' + posts.length + ' posts, ' + tags.length + ' tags and ' + statics.length + ' static files');
   output['build-report.txt'] = diagnostics.join('\n') + '\n';
