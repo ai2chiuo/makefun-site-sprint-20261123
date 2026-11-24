@@ -200,8 +200,10 @@ function memoize(fn, slots) {
   };
 }
 
-function specialize(parts, escape, binding, memo = true) {
+function specialize(parts, escape, binding, memo = true, resolveInclude, inlineInclude) {
   const blocks = [];
+  const includes = [];
+  let inlineBudget = 8;
   let serial = 0;
   const loopSlot = binding('loop');
   const read = ({ read: { head, tail } }) => {
@@ -210,7 +212,7 @@ function specialize(parts, escape, binding, memo = true) {
     return code;
   };
 
-  function emit(nodes) {
+  function emit(nodes, offset = 0) {
     let code = '';
     for (const part of nodes) {
       if (typeof part === 'string') {
@@ -235,16 +237,25 @@ function specialize(parts, escape, binding, memo = true) {
         code += `s[${loopSlot}]=${l};for(let ${i}=0;${i}<${a}.length;${i}++){`;
         if (slot !== loopSlot) code += `s[${slot}]=${a}[${i}];`;
         code += `${l}.index=${i}+1;${l}.first=${i}===0;${l}.last=${i}+1===${a}.length;`;
-        code += emit(part.body) + `}s[${slot}]=${old};s[${loopSlot}]=${previous};}}`;
+        code += emit(part.body, offset) + `}s[${slot}]=${old};s[${loopSlot}]=${previous};}}`;
       } else if (part.kind === 'if') {
         const v = `v${serial++}`;
         code += `{const ${v}=${read(part)};if((Array.isArray(${v})?${v}.length>0:Boolean(${v})||Number.isNaN(${v}))!==${part.negate}){`;
-        code += emit(part.body) + '}';
-        if (part.other) code += 'else{' + emit(part.other) + '}';
+        code += emit(part.body, offset) + '}';
+        if (part.other) code += 'else{' + emit(part.other, offset) + '}';
         code += '}';
       } else if (part.kind === 'include') {
-        const t = `t${serial++}`;
-        code += `{const ${t}=t.get(${JSON.stringify(part.name)});if(${t}&&d<8)o+=${t}(s,t,d+1);}`;
+        const depth = offset ? `d+${offset}` : 'd';
+        const nested = inlineBudget > 0 && offset < 2 && inlineInclude(part.name);
+        if (nested) {
+          inlineBudget--;
+          code += `if(${depth}<8){${emit(nested, offset + 1)}}`;
+        } else {
+          const render = resolveInclude(part.name);
+          if (!render) continue;
+          const index = includes.push(render) - 1;
+          code += `if(${depth}<8)o+=c[${index}](s,t,${depth}+1);`;
+        }
       } else {
         const value = `display(${read(part)})`;
         code += 'o+=' + (part.raw ? value : `html(${value})`) + ';';
@@ -254,7 +265,7 @@ function specialize(parts, escape, binding, memo = true) {
   }
   // The emitted source contains fixed syntax, slot numbers and quoted data literals.
   const code = 'return function(s,t,d){let o="";' + emit(parts) + 'return o;}';
-  const render = new Function('own', 'html', 'display', 'b', code)(own, escape, display, blocks);
+  const render = new Function('own', 'html', 'display', 'b', 'c', code)(own, escape, display, blocks, includes);
   const heads = memo && reusable(parts);
   return heads ? memoize(render, heads.map(binding)) : render;
 }
@@ -314,11 +325,20 @@ function buildRenderers(parsed, escape, binding) {
   }
 
   const renderers = new Map();
+  const resolveInclude = name => renderers.get(name);
+  function inlineInclude(name) {
+    const parts = parsed.get(name);
+    if (!parts || parts.length > 16 || parts.some(part => part.kind === 'for' || part.kind === 'if')) return;
+    // A leaf-depth dependency cannot be removed by expanding more includes.
+    // Preserve the cache for templates which can still benefit from it.
+    const names = namesAt(name, 8);
+    if (names.size > 1 || names.has('loop')) return parts;
+  }
   for (const [name, parts] of parsed) {
     let render;
     const byDepth = [];
     renderers.set(name, (scope, templates, depth) => {
-      render ??= specialize(parts, escape, binding);
+      render ??= specialize(parts, escape, binding, true, resolveInclude, inlineInclude);
       if (depth === 0) return render(scope, templates, depth);
       let memo = byDepth[depth];
       if (memo === undefined) {
